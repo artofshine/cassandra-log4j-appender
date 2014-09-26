@@ -55,6 +55,7 @@ public class CassandraAppender extends AppenderSkeleton
 
     // CF column names
     public static final String ID = "key";
+    public static final String DATE = "date";
     public static final String HOST_IP = "host_ip";
     public static final String HOST_NAME = "host_name";
     public static final String APP_NAME = "app_name";
@@ -70,6 +71,9 @@ public class CassandraAppender extends AppenderSkeleton
     public static final String THREAD_NAME = "thread_name";
     public static final String THROWABLE_STR = "throwable_str_rep";
     public static final String TIMESTAMP = "log_timestamp";
+
+    private String primaryKeyCols = String.format("%s, %s, %s", HOST_NAME, APP_NAME, DATE);
+    private String clusterKeyCols = String.format("%s", TIMESTAMP);
 
     // session state
     private PreparedStatement statement;
