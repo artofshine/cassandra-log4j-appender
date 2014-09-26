@@ -29,7 +29,7 @@ import javax.net.ssl.TrustManagerFactory;
 
 /**
  * Main class that uses Cassandra to store log entries into.
- * 
+ *
  */
 public class CassandraAppender extends AppenderSkeleton
 {
@@ -104,7 +104,7 @@ public class CassandraAppender extends AppenderSkeleton
     }
 
     //Connect to cassandra, then setup the schema and preprocessed statement
-    private synchronized void initClient()
+    protected synchronized void initClient()
     {
         // We should be able to go without an Atomic variable here.  There are two potential problems:
         // 1. Multiple threads read intialized=false and call init client.  However, the method is
@@ -122,7 +122,7 @@ public class CassandraAppender extends AppenderSkeleton
 		try
         {
             Cluster.Builder builder = Cluster.builder()
-                                             .addContactPoints(hosts.split(",\\s*"))
+                                             .addContactPoints(hosts.split(",s*"))
                                              .withPort(port)
                                              .withLoadBalancingPolicy(new RoundRobinPolicy());
 
@@ -169,12 +169,12 @@ public class CassandraAppender extends AppenderSkeleton
     private void setupSchema() throws IOException
     {
         //Create keyspace if necessary
-        String ksQuery = String.format("CREATE KEYSPACE IF NOT EXISTS \"%s\" WITH REPLICATION = %s;",
+        String ksQuery = String.format("CREATE KEYSPACE IF NOT EXISTS %s WITH REPLICATION = %s;",
                                        keyspaceName, replication);
         session.execute(ksQuery);
 
         //Create table if necessary
-        String cfQuery =  String.format("CREATE TABLE IF NOT EXISTS \"%s\".\"%s\" (%s UUID PRIMARY KEY, " +
+        String cfQuery =  String.format("CREATE TABLE IF NOT EXISTS %s.%s (%s UUID PRIMARY KEY, " +
                                         "%s text, %s bigint, %s text, %s text, %s text, %s text, %s text," +
                                         "%s text, %s text, %s bigint, %s text, %s text, %s text, %s text," +
                                         "%s text);",
@@ -190,7 +190,7 @@ public class CassandraAppender extends AppenderSkeleton
     private void setupStatement()
     {
         //Preprocess our append statement
-        String insertQuery = String.format("INSERT INTO \"%s\".\"%s\" " +
+        String insertQuery = String.format("INSERT INTO %s.%s " +
                                            "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) " +
                                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?); ",
                                            keyspaceName, columnFamily, ID, APP_NAME, HOST_IP, HOST_NAME, LOGGER_NAME,
@@ -415,7 +415,7 @@ public class CassandraAppender extends AppenderSkeleton
 
 	/**
 	 * Strips leading and trailing '"' characters
-	 * 
+	 *
 	 * @param b
 	 *            - string to unescape
 	 * @return String - unexspaced string
