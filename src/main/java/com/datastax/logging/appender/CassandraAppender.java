@@ -8,8 +8,17 @@ import java.security.SecureRandom;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedTransferQueue;
 
+import com.codahale.metrics.Counter;
+import com.codahale.metrics.JmxReporter;
+import com.codahale.metrics.MetricRegistry;
 import com.datastax.driver.core.*;
+import com.datastax.driver.core.querybuilder.Batch;
+import com.datastax.driver.core.querybuilder.Insert;
+import com.datastax.driver.core.querybuilder.QueryBuilder;
 import org.apache.log4j.AppenderSkeleton;
 import org.apache.log4j.Level;
 import org.apache.log4j.LogManager;
@@ -22,10 +31,13 @@ import org.codehaus.jackson.map.ObjectMapper;
 import com.datastax.driver.core.policies.RoundRobinPolicy;
 
 import com.google.common.base.Joiner;
+import org.joda.time.DateTime;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
+
+import static com.codahale.metrics.MetricRegistry.name;
 
 /**
  * Main class that uses Cassandra to store log entries into.
@@ -35,11 +47,11 @@ public class CassandraAppender extends AppenderSkeleton
 {
     // Cassandra configuration
     private String hosts = "localhost";
-    private int port = 9042; //for the binary protocol, 9160 is default for thrift
+    private int port = 9042; //for the binary pr    otocol, 9160 is default for thrift
     private String username = "";
     private String password = "";
-    private static final String ip = getIP();
-    private static final String hostname = getHostName();
+    private String ip = getLocalIP();
+    private String hostname = getLocalHostName();
 
     // Encryption.  sslOptions and authProviderOptions are JSON maps requiring Jackson
     private static final ObjectMapper jsonMapper = new ObjectMapper();
@@ -48,7 +60,8 @@ public class CassandraAppender extends AppenderSkeleton
 
     // Keyspace/ColumnFamily information
     private String keyspaceName = "Logging";
-	private String columnFamily = "log_entries";
+	private String cfLogForDate = "log_entries_date";
+    private String cfLogForVLevel = "log_entries_vlevel";
 	private String appName = "default";
     private String replication = "{ 'class' : 'SimpleStrategy', 'replication_factor' : 1 }";
     private ConsistencyLevel consistencyLevelWrite = ConsistencyLevel.ONE;
@@ -61,6 +74,7 @@ public class CassandraAppender extends AppenderSkeleton
     public static final String APP_NAME = "app_name";
     public static final String LOGGER_NAME = "logger_name";
     public static final String LEVEL = "level";
+    public static final String VLEVEL = "vlevel";
     public static final String CLASS_NAME = "class_name";
     public static final String FILE_NAME = "file_name";
     public static final String LINE_NUMBER = "line_number";
@@ -72,9 +86,6 @@ public class CassandraAppender extends AppenderSkeleton
     public static final String THROWABLE_STR = "throwable_str_rep";
     public static final String TIMESTAMP = "log_timestamp";
 
-    private String primaryKeyCols = String.format("%s, %s, %s", HOST_NAME, APP_NAME, DATE);
-    private String clusterKeyCols = String.format("%s", TIMESTAMP);
-
     // session state
     private PreparedStatement statement;
     private volatile boolean initialized = false;
@@ -82,8 +93,29 @@ public class CassandraAppender extends AppenderSkeleton
     private Cluster cluster;
     private Session session;
 
+    // perfomance state
+    private int connPerHost = 20;
+    private int countLoggerConsumers = 40;
+
+    // async tuning
+    LinkedTransferQueue<ResultSetFuture> resultFutures;
+    LinkedTransferQueue<LoggingEvent> queueLogEvents;
+
+    // metrics
+    public static final MetricRegistry metrics = new MetricRegistry();
+    private Counter brokenLogs;
+    private Counter attemptLogs;
+    private Counter queueLogs;
+
     public CassandraAppender()
     {
+        brokenLogs = metrics.counter(name(CassandraAppender.class, "BrokenLogsCount"));
+        attemptLogs = metrics.counter(name(CassandraAppender.class, "AttemptLogsCount"));
+        queueLogs = metrics.counter(name(CassandraAppender.class, "QueueLogsCount"));
+
+        final JmxReporter jmxReporter = JmxReporter.forRegistry(metrics).build();
+        jmxReporter.start();
+
 		LogLog.debug("Creating CassandraAppender");
 	}
 
@@ -97,10 +129,17 @@ public class CassandraAppender extends AppenderSkeleton
         // references some Hadoop classes which can't safely be used until the logging
         // infrastructure is fully set up. If we attempt to initialize the client
         // earlier, it causes NPE's from the constructor of org.apache.hadoop.conf.Configuration.
+
         if (!initialized)
             initClient();
-        if (!initializationFailed)
-            createAndExecuteQuery(event);
+        if (!initializationFailed) {
+            queueLogEvents.put(event);
+            queueLogs.inc();
+        }
+//            if (queueLogEvents.tryTransfer(event))
+//                attemptLogs.inc();
+//            else
+//                brokenLogs.inc();
     }
 
     //Connect to cassandra, then setup the schema and preprocessed statement
@@ -124,7 +163,11 @@ public class CassandraAppender extends AppenderSkeleton
             Cluster.Builder builder = Cluster.builder()
                                              .addContactPoints(hosts.split(",s*"))
                                              .withPort(port)
-                                             .withLoadBalancingPolicy(new RoundRobinPolicy());
+                                             .withLoadBalancingPolicy(new RoundRobinPolicy())
+                                             .withPoolingOptions(
+                                                     new PoolingOptions()
+                                                             .setMaxConnectionsPerHost(HostDistance.LOCAL, connPerHost)
+                                                             .setCoreConnectionsPerHost(HostDistance.LOCAL, connPerHost));
 
             // Kerberos provides authentication anyway, so a username and password are superfluous.  SSL
             // is compatible with either.
@@ -142,10 +185,11 @@ public class CassandraAppender extends AppenderSkeleton
                 builder = builder.withCredentials(username, password);
 
             cluster = builder.build();
-		    session = cluster.connect();
+            //TODO: Проблема курицы и яйца. При первом запуске keyspace не существует, а подключение не создается чтобы создать его далее
+		    session = cluster.connect(keyspaceName);
             setupSchema();
-            setupStatement();
-		}
+            setupAsync();
+        }
         catch (Exception e)
         {
 		    LogLog.error("Error ", e);
@@ -164,80 +208,152 @@ public class CassandraAppender extends AppenderSkeleton
 
 
     /**
+     * Initialize queue and consumers for async execution
+     */
+    private void setupAsync() {
+        queueLogEvents = new LinkedTransferQueue<LoggingEvent>();
+        ExecutorService loggerConsumers = Executors.newFixedThreadPool(countLoggerConsumers);
+        for (int i = 0; i < countLoggerConsumers; i++)
+            loggerConsumers.execute(new LoggerConsumer(queueLogEvents, session, queueLogs,
+                    appName, ip, hostname, cfLogForDate, cfLogForVLevel));
+
+//        resultFutures = new LinkedTransferQueue<ResultSetFuture>();
+//        ExecutorService fAnalyzePool= Executors.newFixedThreadPool(connPerHost * 9);
+//        for (int i = 0; i < connPerHost * 9; i++) {
+//            fAnalyzePool.execute(new FutureAnalyzer(resultFutures));
+//        }
+    }
+
+    /**
      * Create Keyspace and CF if they do not exist.
      */
     private void setupSchema() throws IOException
     {
-        //Create keyspace if necessary
-        String ksQuery = String.format("CREATE KEYSPACE IF NOT EXISTS %s WITH REPLICATION = %s;",
-                                       keyspaceName, replication);
-        session.execute(ksQuery);
+        {
+            //Create keyspace if necessary
+            String query = String.format("CREATE KEYSPACE IF NOT EXISTS %s WITH REPLICATION = %s;",
+                    keyspaceName, replication);
+            session.execute(query);
+        }
 
-        //Create table if necessary
-        String cfQuery =  String.format("CREATE TABLE IF NOT EXISTS %s.%s (%s UUID PRIMARY KEY, " +
-                                        "%s text, %s bigint, %s text, %s text, %s text, %s text, %s text," +
-                                        "%s text, %s text, %s bigint, %s text, %s text, %s text, %s text," +
-                                        "%s text);",
-                                        keyspaceName, columnFamily, ID, APP_NAME, APP_START_TIME, CLASS_NAME,
-                                        FILE_NAME, HOST_IP, HOST_NAME, LEVEL, LINE_NUMBER, METHOD_NAME,
-                                        TIMESTAMP, LOGGER_NAME, MESSAGE, NDC, THREAD_NAME, THROWABLE_STR);
-        session.execute(cfQuery);
-    }
+        {
+            String primaryKeyCols = String.format("%s, %s, %s", HOST_NAME, APP_NAME, DATE);
+            String clusterKeyCols = String.format("%s, %s", TIMESTAMP, ID);
 
-    /**
-     * Setup and preprocess our insert query, so that we can just bind values and send them over the binary protocol
-     */
-    private void setupStatement()
-    {
-        //Preprocess our append statement
-        String insertQuery = String.format("INSERT INTO %s.%s " +
-                                           "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) " +
-                                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?); ",
-                                           keyspaceName, columnFamily, ID, APP_NAME, HOST_IP, HOST_NAME, LOGGER_NAME,
-                                           LEVEL, CLASS_NAME, FILE_NAME, LINE_NUMBER, METHOD_NAME, MESSAGE, NDC,
-                                           APP_START_TIME, THREAD_NAME, THROWABLE_STR, TIMESTAMP);
+            //Create table if necessary pure log
+            String query = String.format("CREATE TABLE IF NOT EXISTS %s (%s UUID, " +
+                            "%s text, %s bigint, %s text, %s text, %s text, %s text, %s text," +
+                            "%s text, %s text, %s bigint, %s text, %s text, %s text, %s text," +
+                            "%s text, %s bigint, PRIMARY KEY ((%s), %s)) WITH CLUSTERING ORDER BY" +
+                            "(%s DESC);",
+                    cfLogForDate, ID, APP_NAME, APP_START_TIME, CLASS_NAME,
+                    FILE_NAME, HOST_IP, HOST_NAME, LEVEL, LINE_NUMBER, METHOD_NAME,
+                    TIMESTAMP, LOGGER_NAME, MESSAGE, NDC, THREAD_NAME, THROWABLE_STR, DATE,
+                    primaryKeyCols, clusterKeyCols, TIMESTAMP);
+            session.execute(query);
+        }
 
-        statement = session.prepare(insertQuery);
-        statement.setConsistencyLevel(ConsistencyLevel.valueOf(consistencyLevelWrite.toString()));
+        {
+            String primaryKeyCols = String.format("%s, %s, %s", HOST_NAME, APP_NAME, VLEVEL);
+            String clusterKeyCols = String.format("%s, %s", TIMESTAMP, ID);
+            //Create table if necessary mixes level
+            String query = String.format("CREATE TABLE IF NOT EXISTS %s (%s UUID, " +
+                            "%s text, %s bigint, %s text, %s text, %s text, %s text, %s text," +
+                            "%s text, %s text, %s bigint, %s text, %s text, %s text, %s text," +
+                            "%s text, %s text, PRIMARY KEY ((%s), %s)) WITH CLUSTERING ORDER BY" +
+                            "(%s DESC);",
+                    cfLogForVLevel, ID, APP_NAME, APP_START_TIME, CLASS_NAME,
+                    FILE_NAME, HOST_IP, HOST_NAME, LEVEL, LINE_NUMBER, METHOD_NAME,
+                    TIMESTAMP, LOGGER_NAME, MESSAGE, NDC, THREAD_NAME, THROWABLE_STR, VLEVEL,
+                    primaryKeyCols, clusterKeyCols, TIMESTAMP);
+            session.execute(query);
+        }
     }
 
     /**
      * Send one logging event to Cassandra.  We just bind the new values into the preprocessed query
      * built by setupStatement
+     * TODO: В случае если один из execute завершается с ошибкой, завершить процедуру без выброса Exception. Ситуацию можно воссоздать при RF = 1 и отключением любой из нод. Пример: Unexpected exception in the selector loop.java.lang.StackOverflowError
+     * Проблема возникает еще и потому, что в случае ошибки Appender сыпит ошибки в общий лог, которые и пытается залогировать.
      */
     private void createAndExecuteQuery(LoggingEvent event)
     {
-		BoundStatement bound = new BoundStatement(statement);
-
-        // A primary key combination of timestamp/hostname/threadname should be unique as long as the thread names
-        // are set, but would not be backwards compatible.  Do we care?
-        bound.setUUID(0, UUID.randomUUID());
-
-        bound.setString(1, appName);
-        bound.setString(2, ip);
-        bound.setString(3, hostname);
-        bound.setString(4, event.getLoggerName());
-        bound.setString(5, event.getLevel().toString());
-
         LocationInfo locInfo = event.getLocationInformation();
+        String className = null, fileName = null, lineNumber = null, methodName = null;
         if (locInfo != null) {
-            bound.setString(6, locInfo.getClassName());
-            bound.setString(7, locInfo.getFileName());
-            bound.setString(8, locInfo.getLineNumber());
-            bound.setString(9, locInfo.getMethodName());
+            className = locInfo.getClassName();
+            fileName = locInfo.getFileName();
+            lineNumber = locInfo.getLineNumber();
+            methodName = locInfo.getMethodName();
         }
 
-        bound.setString(10, event.getRenderedMessage());
-        bound.setString(11, event.getNDC());
-        bound.setLong(12, new Long(LoggingEvent.getStartTime()));
-        bound.setString(13, event.getThreadName());
-
         String[] throwableStrs = event.getThrowableStrRep();
+        String throwable = null;
         if (throwableStrs != null)
-            bound.setString(14, Joiner.on(", ").join(throwableStrs));
+            throwable = Joiner.on(", ").join(throwableStrs);
 
-        bound.setLong(15, new Long(event.getTimeStamp()));
-        session.execute(bound);
+        DateTime dateTime = new DateTime(event.getTimeStamp());
+        long date = dateTime.withTime(0, 0, 0, 0).getMillis();
+
+        {
+            Batch batch = QueryBuilder.batch();
+            Insert lfdQuery = QueryBuilder.insertInto(cfLogForDate)
+                    .value(ID, UUID.randomUUID())
+                    .value(APP_NAME, appName)
+                    .value(HOST_IP, ip)
+                    .value(HOST_NAME, hostname)
+                    .value(LOGGER_NAME, event.getLoggerName())
+                    .value(LEVEL, event.getLevel().toString())
+                    .value(CLASS_NAME, className)
+                    .value(FILE_NAME, fileName)
+                    .value(LINE_NUMBER, lineNumber)
+                    .value(METHOD_NAME, methodName)
+                    .value(MESSAGE, event.getRenderedMessage())
+                    .value(NDC, event.getNDC())
+                    .value(APP_START_TIME, LoggingEvent.getStartTime())
+                    .value(THREAD_NAME, event.getThreadName())
+                    .value(THROWABLE_STR, throwable)
+                    .value(TIMESTAMP, event.getTimeStamp())
+                    .value(DATE, date);
+
+            batch.add(lfdQuery);
+
+            for (Level level : new Level[]{Level.TRACE, Level.DEBUG, Level.INFO,
+                    Level.WARN, Level.ERROR, Level.FATAL, Level.ALL}) {
+                if (event.getLevel().isGreaterOrEqual(level)){
+                    Insert lfvQuery = QueryBuilder.insertInto(cfLogForVLevel)
+                            .value(ID, UUID.randomUUID())
+                            .value(APP_NAME, appName)
+                            .value(HOST_IP, ip)
+                            .value(HOST_NAME, hostname)
+                            .value(LOGGER_NAME, event.getLoggerName())
+                            .value(LEVEL, event.getLevel().toString())
+                            .value(CLASS_NAME, className)
+                            .value(FILE_NAME, fileName)
+                            .value(LINE_NUMBER, lineNumber)
+                            .value(METHOD_NAME, methodName)
+                            .value(MESSAGE, event.getRenderedMessage())
+                            .value(NDC, event.getNDC())
+                            .value(APP_START_TIME, LoggingEvent.getStartTime())
+                            .value(THREAD_NAME, event.getThreadName())
+                            .value(THROWABLE_STR, throwable)
+                            .value(TIMESTAMP, event.getTimeStamp())
+                            .value(VLEVEL, level.toString());
+
+                    batch.add(lfvQuery);
+                }
+            }
+            ResultSetFuture future = null;
+            try {
+                future = session.executeAsync(batch);
+            } catch (Exception e) {
+            }
+            try {
+                resultFutures.transfer(future);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
     }
 
     /**
@@ -282,7 +398,7 @@ public class CassandraAppender extends AppenderSkeleton
 		this.keyspaceName = keyspaceName;
 	}
 
-	public String getHosts()
+	public String keyosts()
     {
 		return hosts;
 	}
@@ -322,17 +438,39 @@ public class CassandraAppender extends AppenderSkeleton
 		this.password = unescape(password);
 	}
 
-	public String getColumnFamily()
-    {
-		return columnFamily;
-	}
+    public String getIp() {
+        return ip;
+    }
 
-	public void setColumnFamily(String columnFamily)
-    {
-		this.columnFamily = columnFamily;
-	}
+    public void setIp(String ip) {
+        this.ip = ip;
+    }
 
-	public String getReplication()
+    public String getHostname() {
+        return hostname;
+    }
+
+    public void setHostname(String hostname) {
+        this.hostname = hostname;
+    }
+
+    public String getCfLogForDate() {
+        return cfLogForDate;
+    }
+
+    public void setCfLogForDate(String cfLogForDate) {
+        this.cfLogForDate = cfLogForDate;
+    }
+
+    public String getCfLogForVLevel() {
+        return cfLogForVLevel;
+    }
+
+    public void setCfLogForVLevel(String cfLogForVLevel) {
+        this.cfLogForVLevel = cfLogForVLevel;
+    }
+
+    public String getReplication()
     {
 		return replication;
 	}
@@ -387,7 +525,15 @@ public class CassandraAppender extends AppenderSkeleton
 		this.appName = appName;
 	}
 
-	private static String getHostName()
+    public int getConnPerHost() {
+        return connPerHost;
+    }
+
+    public void setConnPerHost(int connPerHost) {
+        this.connPerHost = connPerHost;
+    }
+
+    private static String getLocalHostName()
     {
 		String hostname = "unknown";
 
@@ -400,7 +546,7 @@ public class CassandraAppender extends AppenderSkeleton
 		return hostname;
 	}
 
-	private static String getIP()
+	private static String getLocalIP()
     {
 		String ip = "unknown";
 
