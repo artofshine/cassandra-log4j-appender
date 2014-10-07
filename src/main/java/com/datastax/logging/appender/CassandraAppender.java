@@ -13,6 +13,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedTransferQueue;
 
 import com.codahale.metrics.Counter;
+import com.codahale.metrics.Histogram;
 import com.codahale.metrics.JmxReporter;
 import com.codahale.metrics.MetricRegistry;
 import com.datastax.driver.core.*;
@@ -59,9 +60,10 @@ public class CassandraAppender extends AppenderSkeleton
     private Map<String, String> authProviderOptions = null;
 
     // Keyspace/ColumnFamily information
+    public static final String cfLogForDate = "log_entries_date";
+    public static final String cfLogForVLevel = "log_entries_vlevel";
+
     private String keyspaceName = "Logging";
-	private String cfLogForDate = "log_entries_date";
-    private String cfLogForVLevel = "log_entries_vlevel";
 	private String appName = "default";
     private String replication = "{ 'class' : 'SimpleStrategy', 'replication_factor' : 1 }";
     private ConsistencyLevel consistencyLevelWrite = ConsistencyLevel.ONE;
@@ -94,24 +96,28 @@ public class CassandraAppender extends AppenderSkeleton
     private Session session;
 
     // perfomance state
-    private int connPerHost = 20;
-    private int countLoggerConsumers = 40;
+    public static int countLoggerConsumers = 3;
 
     // async tuning
-    LinkedTransferQueue<ResultSetFuture> resultFutures;
     LinkedTransferQueue<LoggingEvent> queueLogEvents;
+
+    //filter
+    private long maxSizeMessage = 100000L;
 
     // metrics
     public static final MetricRegistry metrics = new MetricRegistry();
-    private Counter brokenLogs;
-    private Counter attemptLogs;
-    private Counter queueLogs;
+    public static volatile Counter brokenLogs;
+    public static volatile Counter attemptLogs;
+    public static volatile Counter queueLogs;
+    public static volatile Histogram sizeMessage;
+
 
     public CassandraAppender()
     {
         brokenLogs = metrics.counter(name(CassandraAppender.class, "BrokenLogsCount"));
         attemptLogs = metrics.counter(name(CassandraAppender.class, "AttemptLogsCount"));
         queueLogs = metrics.counter(name(CassandraAppender.class, "QueueLogsCount"));
+        sizeMessage = metrics.histogram(name(CassandraAppender.class, "SizeMessage"));
 
         final JmxReporter jmxReporter = JmxReporter.forRegistry(metrics).build();
         jmxReporter.start();
@@ -163,11 +169,7 @@ public class CassandraAppender extends AppenderSkeleton
             Cluster.Builder builder = Cluster.builder()
                                              .addContactPoints(hosts.split(",s*"))
                                              .withPort(port)
-                                             .withLoadBalancingPolicy(new RoundRobinPolicy())
-                                             .withPoolingOptions(
-                                                     new PoolingOptions()
-                                                             .setMaxConnectionsPerHost(HostDistance.LOCAL, connPerHost)
-                                                             .setCoreConnectionsPerHost(HostDistance.LOCAL, connPerHost));
+                                             .withLoadBalancingPolicy(new RoundRobinPolicy());
 
             // Kerberos provides authentication anyway, so a username and password are superfluous.  SSL
             // is compatible with either.
@@ -214,14 +216,8 @@ public class CassandraAppender extends AppenderSkeleton
         queueLogEvents = new LinkedTransferQueue<LoggingEvent>();
         ExecutorService loggerConsumers = Executors.newFixedThreadPool(countLoggerConsumers);
         for (int i = 0; i < countLoggerConsumers; i++)
-            loggerConsumers.execute(new LoggerConsumer(queueLogEvents, session, queueLogs,
-                    appName, ip, hostname, cfLogForDate, cfLogForVLevel));
-
-//        resultFutures = new LinkedTransferQueue<ResultSetFuture>();
-//        ExecutorService fAnalyzePool= Executors.newFixedThreadPool(connPerHost * 9);
-//        for (int i = 0; i < connPerHost * 9; i++) {
-//            fAnalyzePool.execute(new FutureAnalyzer(resultFutures));
-//        }
+            loggerConsumers.execute(new LoggerConsumer(queueLogEvents, session, maxSizeMessage,
+                    appName, ip, hostname));
     }
 
     /**
@@ -270,91 +266,6 @@ public class CassandraAppender extends AppenderSkeleton
         }
     }
 
-    /**
-     * Send one logging event to Cassandra.  We just bind the new values into the preprocessed query
-     * built by setupStatement
-     * TODO: В случае если один из execute завершается с ошибкой, завершить процедуру без выброса Exception. Ситуацию можно воссоздать при RF = 1 и отключением любой из нод. Пример: Unexpected exception in the selector loop.java.lang.StackOverflowError
-     * Проблема возникает еще и потому, что в случае ошибки Appender сыпит ошибки в общий лог, которые и пытается залогировать.
-     */
-    private void createAndExecuteQuery(LoggingEvent event)
-    {
-        LocationInfo locInfo = event.getLocationInformation();
-        String className = null, fileName = null, lineNumber = null, methodName = null;
-        if (locInfo != null) {
-            className = locInfo.getClassName();
-            fileName = locInfo.getFileName();
-            lineNumber = locInfo.getLineNumber();
-            methodName = locInfo.getMethodName();
-        }
-
-        String[] throwableStrs = event.getThrowableStrRep();
-        String throwable = null;
-        if (throwableStrs != null)
-            throwable = Joiner.on(", ").join(throwableStrs);
-
-        DateTime dateTime = new DateTime(event.getTimeStamp());
-        long date = dateTime.withTime(0, 0, 0, 0).getMillis();
-
-        {
-            Batch batch = QueryBuilder.batch();
-            Insert lfdQuery = QueryBuilder.insertInto(cfLogForDate)
-                    .value(ID, UUID.randomUUID())
-                    .value(APP_NAME, appName)
-                    .value(HOST_IP, ip)
-                    .value(HOST_NAME, hostname)
-                    .value(LOGGER_NAME, event.getLoggerName())
-                    .value(LEVEL, event.getLevel().toString())
-                    .value(CLASS_NAME, className)
-                    .value(FILE_NAME, fileName)
-                    .value(LINE_NUMBER, lineNumber)
-                    .value(METHOD_NAME, methodName)
-                    .value(MESSAGE, event.getRenderedMessage())
-                    .value(NDC, event.getNDC())
-                    .value(APP_START_TIME, LoggingEvent.getStartTime())
-                    .value(THREAD_NAME, event.getThreadName())
-                    .value(THROWABLE_STR, throwable)
-                    .value(TIMESTAMP, event.getTimeStamp())
-                    .value(DATE, date);
-
-            batch.add(lfdQuery);
-
-            for (Level level : new Level[]{Level.TRACE, Level.DEBUG, Level.INFO,
-                    Level.WARN, Level.ERROR, Level.FATAL, Level.ALL}) {
-                if (event.getLevel().isGreaterOrEqual(level)){
-                    Insert lfvQuery = QueryBuilder.insertInto(cfLogForVLevel)
-                            .value(ID, UUID.randomUUID())
-                            .value(APP_NAME, appName)
-                            .value(HOST_IP, ip)
-                            .value(HOST_NAME, hostname)
-                            .value(LOGGER_NAME, event.getLoggerName())
-                            .value(LEVEL, event.getLevel().toString())
-                            .value(CLASS_NAME, className)
-                            .value(FILE_NAME, fileName)
-                            .value(LINE_NUMBER, lineNumber)
-                            .value(METHOD_NAME, methodName)
-                            .value(MESSAGE, event.getRenderedMessage())
-                            .value(NDC, event.getNDC())
-                            .value(APP_START_TIME, LoggingEvent.getStartTime())
-                            .value(THREAD_NAME, event.getThreadName())
-                            .value(THROWABLE_STR, throwable)
-                            .value(TIMESTAMP, event.getTimeStamp())
-                            .value(VLEVEL, level.toString());
-
-                    batch.add(lfvQuery);
-                }
-            }
-            ResultSetFuture future = null;
-            try {
-                future = session.executeAsync(batch);
-            } catch (Exception e) {
-            }
-            try {
-                resultFutures.transfer(future);
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-        }
-    }
 
     /**
      * {@inheritDoc}
@@ -454,22 +365,6 @@ public class CassandraAppender extends AppenderSkeleton
         this.hostname = hostname;
     }
 
-    public String getCfLogForDate() {
-        return cfLogForDate;
-    }
-
-    public void setCfLogForDate(String cfLogForDate) {
-        this.cfLogForDate = cfLogForDate;
-    }
-
-    public String getCfLogForVLevel() {
-        return cfLogForVLevel;
-    }
-
-    public void setCfLogForVLevel(String cfLogForVLevel) {
-        this.cfLogForVLevel = cfLogForVLevel;
-    }
-
     public String getReplication()
     {
 		return replication;
@@ -479,6 +374,14 @@ public class CassandraAppender extends AppenderSkeleton
     {
 		replication = unescape(strategy);
 	}
+
+    public long getMaxSizeMessage() {
+        return maxSizeMessage;
+    }
+
+    public void setMaxSizeMessage(long maxSizeMessage) {
+        this.maxSizeMessage = maxSizeMessage;
+    }
 
     private Map<String, String> parseJsonMap(String options, String type) throws Exception
     {
@@ -514,7 +417,6 @@ public class CassandraAppender extends AppenderSkeleton
 		}
 	}
 
-
     public String getAppName()
     {
 		return appName;
@@ -524,14 +426,6 @@ public class CassandraAppender extends AppenderSkeleton
     {
 		this.appName = appName;
 	}
-
-    public int getConnPerHost() {
-        return connPerHost;
-    }
-
-    public void setConnPerHost(int connPerHost) {
-        this.connPerHost = connPerHost;
-    }
 
     private static String getLocalHostName()
     {

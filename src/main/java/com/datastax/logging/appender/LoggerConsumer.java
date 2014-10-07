@@ -12,6 +12,7 @@ import org.apache.log4j.spi.LocationInfo;
 import org.apache.log4j.spi.LoggingEvent;
 import org.joda.time.DateTime;
 
+import java.io.UnsupportedEncodingException;
 import java.util.UUID;
 import java.util.concurrent.LinkedTransferQueue;
 
@@ -21,24 +22,20 @@ import java.util.concurrent.LinkedTransferQueue;
 public class LoggerConsumer implements Runnable {
     private final LinkedTransferQueue<LoggingEvent> queueLogEvents;
     private final Session session;
-    private final Counter queueLogs;
     // Параметры ниже можно перенести в сообщение очереди
     private final String appName;
     private final String ip;
     private final String hostname;
-    private final String cfLogForDate;
-    private final String cfLogForVLevel;
+    private final long sizeMessage;
 
-    public LoggerConsumer(LinkedTransferQueue<LoggingEvent> queueLogEvents, Session session, Counter queueLogs,
-                          String appName, String ip, String hostname, String cfLogForDate, String cfLogForVLevel) {
+    public LoggerConsumer(LinkedTransferQueue<LoggingEvent> queueLogEvents, Session session, long sizeMessage,
+                          String appName, String ip, String hostname) {
         this.queueLogEvents = queueLogEvents;
         this.session = session;
         this.appName = appName;
         this.ip = ip;
         this.hostname = hostname;
-        this.cfLogForDate = cfLogForDate;
-        this.cfLogForVLevel = cfLogForVLevel;
-        this.queueLogs = queueLogs;
+        this.sizeMessage = sizeMessage;
     }
 
     @Override
@@ -47,12 +44,27 @@ public class LoggerConsumer implements Runnable {
             LoggingEvent event = null;
             try {
                 event = queueLogEvents.take();
-                queueLogs.dec();
+                CassandraAppender.queueLogs.dec();
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
+
             if (event != null) {
-                createAndExecuteQuery(event);
+                byte[] utf8Byte = new byte[0];
+                try {
+                    utf8Byte = event.getRenderedMessage().getBytes("UTF-8");
+                } catch (UnsupportedEncodingException e) {
+                    e.printStackTrace();
+                }
+                CassandraAppender.sizeMessage.update(utf8Byte.length);
+
+                // Filter for stupid development
+                if (utf8Byte.length < sizeMessage) {
+                    CassandraAppender.attemptLogs.inc();
+                    createAndExecuteQuery(event);
+                } else {
+                    CassandraAppender.brokenLogs.inc();
+                }
             }
         }
     }
@@ -84,7 +96,7 @@ public class LoggerConsumer implements Runnable {
 
         {
             Batch batch = QueryBuilder.batch();
-            Insert lfdQuery = QueryBuilder.insertInto(cfLogForDate)
+            Insert lfdQuery = QueryBuilder.insertInto(CassandraAppender.cfLogForDate)
                     .value(CassandraAppender.ID, UUID.randomUUID())
                     .value(CassandraAppender.APP_NAME, appName)
                     .value(CassandraAppender.HOST_IP, ip)
@@ -108,7 +120,7 @@ public class LoggerConsumer implements Runnable {
             for (Level level : new Level[]{Level.TRACE, Level.DEBUG, Level.INFO,
                     Level.WARN, Level.ERROR, Level.FATAL, Level.ALL}) {
                 if (event.getLevel().isGreaterOrEqual(level)){
-                    Insert lfvQuery = QueryBuilder.insertInto(cfLogForVLevel)
+                    Insert lfvQuery = QueryBuilder.insertInto(CassandraAppender.cfLogForVLevel)
                             .value(CassandraAppender.ID, UUID.randomUUID())
                             .value(CassandraAppender.APP_NAME, appName)
                             .value(CassandraAppender.HOST_IP, ip)
@@ -131,11 +143,6 @@ public class LoggerConsumer implements Runnable {
                 }
             }
             session.executeAsync(batch);
-//            try {
-//                resultFutures.transfer(future);
-//            } catch (InterruptedException e) {
-//                e.printStackTrace();
-//            }
         }
     }
 }
